@@ -29,7 +29,12 @@ use symphonia::core::units::{Duration, Time, Timestamp};
 use clap::{Arg, ArgMatches};
 use log::{error, info, warn};
 
+use crate::output_sample_rate::OUTPUT_SAMPLE_RATE_CHOICES;
+use crate::resampler_type::ResamplerType;
+
 mod output;
+mod output_sample_rate;
+mod resampler_type;
 mod ui;
 
 #[cfg(not(target_os = "linux"))]
@@ -119,6 +124,31 @@ fn main() {
             Arg::new("dump-visuals")
                 .long("dump-visuals")
                 .help("Dump all visuals to the current working directory"),
+        )
+        .arg({
+            let resampler_values: Vec<&str> = ResamplerType::VARIANTS.to_vec();
+            Arg::new("resampler")
+                .long("resampler")
+                .short('r')
+                .value_name("KIND")
+                .default_value("fft")
+                .possible_values(resampler_values)
+                .help(
+                    "Resampling algorithm when sample rate conversion is needed (cpal backends only; \
+                     ignored on Linux PulseAudio).",
+                )
+        })
+        .arg(
+            Arg::new("output-sample-rate")
+                .long("output-sample-rate")
+                .value_name("HZ")
+                .possible_values(OUTPUT_SAMPLE_RATE_CHOICES)
+                .help(
+                    "Output stream sample rate in Hz (cpal only). Default: match source rate on \
+                     macOS/Linux (non-Windows cpal), or device default on Windows. Choices: 44100 \
+                     (44.1k), 48000, 88200, 96000, 176400, 192000, 352800, 384000, 705600, 768000. \
+                     Ignored on Linux PulseAudio.",
+                ),
         )
         .arg(
             Arg::new("INPUT")
@@ -222,12 +252,26 @@ fn run(args: &ArgMatches) -> Result<i32> {
                     args.get_one::<Timestamp>("seek-ts").map(|&ts| SeekPosition::Timestamp(ts))
                 };
 
+                let resampler_type: ResamplerType = args
+                    .get_one::<String>("resampler")
+                    .expect("resampler has a default")
+                    .parse()
+                    .expect("resampler value was validated by clap");
+
+                let output_sample_rate_hz: Option<u32> =
+                    args.get_one::<String>("output-sample-rate").map(|s| {
+                        s.parse::<u32>()
+                            .expect("output-sample-rate validated by clap possible_values")
+                    });
+
                 // Setup playback options.
                 let opts = PlayOptions {
                     decoder_opts: dec_opts.verify(args.is_present("verify")),
                     track_num,
                     seek_pos,
                     no_progress: args.is_present("no-progress"),
+                    resampler_type,
+                    output_sample_rate_hz,
                 };
 
                 // Play it!
@@ -310,6 +354,9 @@ struct PlayOptions {
     track_num: Option<usize>,
     seek_pos: Option<SeekPosition>,
     no_progress: bool,
+    resampler_type: ResamplerType,
+    /// Forced output stream rate (Hz); `None` uses previous default behavior per backend.
+    output_sample_rate_hz: Option<u32>,
 }
 
 /// Options for playing a single track.
@@ -319,6 +366,8 @@ struct PlayTrackOptions {
     track_id: u32,
     seek_ts: Timestamp,
     no_progress: bool,
+    resampler_type: ResamplerType,
+    output_sample_rate_hz: Option<u32>,
 }
 
 fn play(mut reader: Box<dyn FormatReader>, opts: PlayOptions) -> Result<i32> {
@@ -372,6 +421,8 @@ fn play(mut reader: Box<dyn FormatReader>, opts: PlayOptions) -> Result<i32> {
         track_id,
         seek_ts,
         no_progress: opts.no_progress,
+        resampler_type: opts.resampler_type,
+        output_sample_rate_hz: opts.output_sample_rate_hz,
     };
 
     // The audio output device.
@@ -457,7 +508,18 @@ fn play_track(
                     let duration = Duration::from(decoded.capacity() as u64);
 
                     // Try to open the audio output.
-                    audio_output.replace(output::try_open(decoded.spec(), duration).unwrap());
+                    let (opened, device_info) = output::try_open(
+                        decoded.spec(),
+                        duration,
+                        opts.resampler_type,
+                        opts.output_sample_rate_hz,
+                    )
+                    .unwrap();
+                    ui::print_output_device(
+                        device_info.sample_rate_hz,
+                        device_info.bits_per_sample,
+                    );
+                    audio_output.replace(opened);
                 }
                 else {
                     // TODO: Check the audio spec. and duration hasn't changed.

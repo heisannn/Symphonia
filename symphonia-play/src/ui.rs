@@ -60,6 +60,16 @@ pub fn print_format(path: &Path, format: &mut Box<dyn FormatReader>) {
     println!();
 }
 
+/// Print sample rate and bit depth of the opened audio output device.
+pub fn print_output_device(sample_rate_hz: u32, bits_per_sample: u32) {
+    print_blank();
+    print_header("Output device");
+    print_pair("Sample Rate:", &format!("{sample_rate_hz} Hz"), Bullet::None, 1);
+    print_pair("Bits per Sample:", &bits_per_sample, Bullet::None, 1);
+    println!(":");
+    println!();
+}
+
 pub fn print_update(rev: &MetadataRevision) {
     print_meta_revision(rev);
     println!(":");

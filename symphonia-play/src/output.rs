@@ -9,6 +9,8 @@
 
 use std::result;
 
+use crate::resampler_type::ResamplerType;
+
 use symphonia::core::audio::{AudioSpec, GenericAudioBufferRef};
 use symphonia::core::units::Duration;
 
@@ -28,9 +30,18 @@ pub enum AudioOutputError {
 
 pub type Result<T> = result::Result<T, AudioOutputError>;
 
+/// Sample rate and format of the opened output stream (for UI).
+#[derive(Debug, Clone, Copy)]
+pub struct OutputDeviceInfo {
+    pub sample_rate_hz: u32,
+    pub bits_per_sample: u32,
+}
+
 #[cfg(target_os = "linux")]
 mod pulseaudio {
-    use super::{AudioOutput, AudioOutputError, Result};
+    use crate::resampler_type::ResamplerType;
+
+    use super::{AudioOutput, AudioOutputError, OutputDeviceInfo, Result};
 
     use symphonia::core::audio::*;
     use symphonia::core::units::Duration;
@@ -46,7 +57,21 @@ mod pulseaudio {
     }
 
     impl PulseAudioOutput {
-        pub fn try_open(spec: &AudioSpec, _: Duration) -> Result<Box<dyn AudioOutput>> {
+        pub fn try_open(
+            spec: &AudioSpec,
+            _: Duration,
+            _resampler: ResamplerType,
+            output_sample_rate_hz: Option<u32>,
+        ) -> Result<(Box<dyn AudioOutput>, OutputDeviceInfo)> {
+            if let Some(rate) = output_sample_rate_hz {
+                if rate != spec.rate() {
+                    warn!(
+                        "--output-sample-rate={rate} is ignored on PulseAudio (stream uses source rate {} Hz)",
+                        spec.rate()
+                    );
+                }
+            }
+
             let num_channels = spec.channels().count();
 
             assert!(num_channels < 256);
@@ -59,6 +84,8 @@ mod pulseaudio {
             };
 
             assert!(pa_spec.is_valid());
+
+            let device_info = OutputDeviceInfo { sample_rate_hz: spec.rate(), bits_per_sample: 32 };
 
             let pa_ch_map = map_channels_to_pa_channelmap(spec.channels());
 
@@ -86,7 +113,9 @@ mod pulseaudio {
             );
 
             match pa_result {
-                Ok(pa) => Ok(Box::new(PulseAudioOutput { pa, buf: Default::default() })),
+                Ok(pa) => {
+                    Ok((Box::new(PulseAudioOutput { pa, buf: Default::default() }), device_info))
+                }
                 Err(err) => {
                     error!("audio output stream open error: {err}");
 
@@ -244,9 +273,12 @@ mod pulseaudio {
 
 #[cfg(not(target_os = "linux"))]
 mod cpal {
-    use crate::resampler::Resampler;
+    use std::mem;
 
-    use super::{AudioOutput, AudioOutputError, Result};
+    use crate::resampler::Resampler;
+    use crate::resampler_type::ResamplerType;
+
+    use super::{AudioOutput, AudioOutputError, OutputDeviceInfo, Result};
 
     use symphonia::core::audio::conv::{ConvertibleSample, IntoSample};
     use symphonia::core::audio::{AudioSpec, GenericAudioBufferRef};
@@ -256,6 +288,18 @@ mod cpal {
     use rb::*;
 
     use log::{error, info};
+
+    #[cfg(target_os = "macos")]
+    use coreaudio::audio_unit::SampleFormat as CoreAudioSampleFormat;
+    #[cfg(target_os = "macos")]
+    use coreaudio::audio_unit::audio_format::LinearPcmFlags;
+    #[cfg(target_os = "macos")]
+    use coreaudio::audio_unit::macos_helpers::{
+        find_matching_physical_format, get_default_device_id, set_device_physical_stream_format,
+        set_device_sample_rate,
+    };
+    #[cfg(target_os = "macos")]
+    use coreaudio::audio_unit::stream_format::StreamFormat;
 
     pub struct CpalAudioOutput;
 
@@ -269,7 +313,12 @@ mod cpal {
     impl AudioOutputSample for u16 {}
 
     impl CpalAudioOutput {
-        pub fn try_open(spec: &AudioSpec, duration: Duration) -> Result<Box<dyn AudioOutput>> {
+        pub fn try_open(
+            spec: &AudioSpec,
+            duration: Duration,
+            resampler_type: ResamplerType,
+            output_sample_rate_hz: Option<u32>,
+        ) -> Result<(Box<dyn AudioOutput>, OutputDeviceInfo)> {
             // Get default host.
             let host = cpal::default_host();
 
@@ -292,15 +341,27 @@ mod cpal {
 
             // Select proper playback routine based on sample format.
             match config.sample_format() {
-                cpal::SampleFormat::F32 => {
-                    CpalAudioOutputImpl::<f32>::try_open(spec, duration, &device)
-                }
-                cpal::SampleFormat::I16 => {
-                    CpalAudioOutputImpl::<i16>::try_open(spec, duration, &device)
-                }
-                cpal::SampleFormat::U16 => {
-                    CpalAudioOutputImpl::<u16>::try_open(spec, duration, &device)
-                }
+                cpal::SampleFormat::F32 => CpalAudioOutputImpl::<f32>::try_open(
+                    spec,
+                    duration,
+                    resampler_type,
+                    output_sample_rate_hz,
+                    &device,
+                ),
+                cpal::SampleFormat::I16 => CpalAudioOutputImpl::<i16>::try_open(
+                    spec,
+                    duration,
+                    resampler_type,
+                    output_sample_rate_hz,
+                    &device,
+                ),
+                cpal::SampleFormat::U16 => CpalAudioOutputImpl::<u16>::try_open(
+                    spec,
+                    duration,
+                    resampler_type,
+                    output_sample_rate_hz,
+                    &device,
+                ),
             }
         }
     }
@@ -319,25 +380,115 @@ mod cpal {
         pub fn try_open(
             spec: &AudioSpec,
             duration: Duration,
+            resampler_type: ResamplerType,
+            output_sample_rate_hz: Option<u32>,
             device: &cpal::Device,
-        ) -> Result<Box<dyn AudioOutput>> {
+        ) -> Result<(Box<dyn AudioOutput>, OutputDeviceInfo)> {
             let num_channels = spec.channels().count();
 
             // Output audio stream config.
             let config = if cfg!(not(target_os = "windows")) {
+                let rate = output_sample_rate_hz.unwrap_or(spec.rate());
                 cpal::StreamConfig {
                     channels: num_channels as cpal::ChannelCount,
-                    sample_rate: cpal::SampleRate(spec.rate()),
+                    sample_rate: cpal::SampleRate(rate),
                     buffer_size: cpal::BufferSize::Default,
                 }
             }
             else {
-                // Use the default config for Windows.
-                device
+                // Use the default config for Windows, optionally overriding sample rate.
+                let mut cfg = device
                     .default_output_config()
                     .expect("Failed to get the default output config.")
-                    .config()
+                    .config();
+                if let Some(rate) = output_sample_rate_hz {
+                    cfg.sample_rate = cpal::SampleRate(rate);
+                }
+                cfg
             };
+
+            #[cfg(target_os = "macos")]
+            {
+                use std::any::TypeId;
+
+                if let Some(device_id) = get_default_device_id(false) {
+                    // Many devices list integer PCM in available physical formats but not float;
+                    // try several layouts before falling back to nominal sample rate only.
+                    let candidate_formats: &[CoreAudioSampleFormat] =
+                        if TypeId::of::<T>() == TypeId::of::<f32>() {
+                            &[
+                                CoreAudioSampleFormat::F32,
+                                CoreAudioSampleFormat::I32,
+                                CoreAudioSampleFormat::I24,
+                                CoreAudioSampleFormat::I16,
+                            ]
+                        }
+                        else {
+                            &[
+                                CoreAudioSampleFormat::I16,
+                                CoreAudioSampleFormat::I32,
+                                CoreAudioSampleFormat::I24,
+                            ]
+                        };
+
+                    let mut matched = None;
+                    for &sample_format in candidate_formats {
+                        let desired = StreamFormat {
+                            sample_rate: config.sample_rate.0 as f64,
+                            sample_format,
+                            flags: LinearPcmFlags::empty(),
+                            channels: config.channels as u32,
+                        };
+                        if let Some(asbd) = find_matching_physical_format(device_id, desired) {
+                            matched = Some((asbd, sample_format));
+                            break;
+                        }
+                    }
+
+                    match matched {
+                        Some((mut asbd, matched_format)) => {
+                            // find_matching_physical_format はレンジ内マッチの場合、
+                            // 返される ASBD のサンプルレートが要求値と異なる可能性があるため上書き
+                            asbd.mSampleRate = config.sample_rate.0 as f64;
+
+                            match set_device_physical_stream_format(device_id, asbd) {
+                                Ok(()) => {
+                                    info!(
+                                        "set macOS device physical format to {} Hz, {} bit ({:?})",
+                                        config.sample_rate.0, asbd.mBitsPerChannel, matched_format,
+                                    );
+                                }
+                                Err(err) => {
+                                    error!(
+                                        "failed to set device physical format to {} Hz: {}",
+                                        config.sample_rate.0, err
+                                    );
+                                }
+                            }
+                        }
+                        None => {
+                            let target_rate = config.sample_rate.0 as f64;
+                            match set_device_sample_rate(device_id, target_rate) {
+                                Ok(()) => {
+                                    info!(
+                                        "set macOS device nominal sample rate to {} Hz (no physical format match; using nominal rates)",
+                                        config.sample_rate.0,
+                                    );
+                                }
+                                Err(err) => {
+                                    error!(
+                                        "failed to set device sample rate to {} Hz: {}",
+                                        config.sample_rate.0, err
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                else {
+                    error!("failed to get default output device id");
+                }
+            }
 
             // Create a ring buffer with a capacity for up-to 200ms of audio.
             let ring_len = ((200 * config.sample_rate.0 as usize) / 1000) * num_channels;
@@ -375,18 +526,31 @@ mod cpal {
 
             let resampler = if spec.rate() != config.sample_rate.0 {
                 info!("resampling {} Hz to {} Hz", spec.rate(), config.sample_rate.0);
-                Some(Resampler::new(spec, config.sample_rate.0, duration.get() as usize))
+                Some(Resampler::new(
+                    spec,
+                    config.sample_rate.0,
+                    duration.get() as usize,
+                    resampler_type,
+                ))
             }
             else {
                 None
             };
 
-            Ok(Box::new(CpalAudioOutputImpl {
-                ring_buf_producer,
-                output: Default::default(),
-                stream,
-                resampler,
-            }))
+            let device_info = OutputDeviceInfo {
+                sample_rate_hz: config.sample_rate.0,
+                bits_per_sample: (mem::size_of::<T>() * 8) as u32,
+            };
+
+            Ok((
+                Box::new(CpalAudioOutputImpl {
+                    ring_buf_producer,
+                    output: Default::default(),
+                    stream,
+                    resampler,
+                }),
+                device_info,
+            ))
         }
     }
 
@@ -434,11 +598,21 @@ mod cpal {
 }
 
 #[cfg(target_os = "linux")]
-pub fn try_open(spec: &AudioSpec, duration: Duration) -> Result<Box<dyn AudioOutput>> {
-    pulseaudio::PulseAudioOutput::try_open(spec, duration)
+pub fn try_open(
+    spec: &AudioSpec,
+    duration: Duration,
+    resampler: ResamplerType,
+    output_sample_rate_hz: Option<u32>,
+) -> Result<(Box<dyn AudioOutput>, OutputDeviceInfo)> {
+    pulseaudio::PulseAudioOutput::try_open(spec, duration, resampler, output_sample_rate_hz)
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn try_open(spec: &AudioSpec, duration: Duration) -> Result<Box<dyn AudioOutput>> {
-    cpal::CpalAudioOutput::try_open(spec, duration)
+pub fn try_open(
+    spec: &AudioSpec,
+    duration: Duration,
+    resampler_type: ResamplerType,
+    output_sample_rate_hz: Option<u32>,
+) -> Result<(Box<dyn AudioOutput>, OutputDeviceInfo)> {
+    cpal::CpalAudioOutput::try_open(spec, duration, resampler_type, output_sample_rate_hz)
 }

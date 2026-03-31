@@ -30,8 +30,11 @@ symphonia = { version = "0.6.0-alpha.1", path = "../symphonia", features = ["all
 libpulse-binding = "2.5.0"
 libpulse-simple-binding = "2.5.0"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+coreaudio-rs = "0.14.0"
+
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 cpal = "0.13.3"
 rb = "0.3.2"
-rubato = "0.14.1"
-smallvec = { workspace = true }
+rubato = "1.0.1"
+audioadapter-buffers = "2.0"
