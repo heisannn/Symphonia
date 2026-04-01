@@ -13,7 +13,7 @@
 #![allow(clippy::needless_update)]
 
 use std::ffi::{OsStr, OsString};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -32,6 +32,7 @@ use log::{error, info, warn};
 use crate::output_sample_rate::OUTPUT_SAMPLE_RATE_CHOICES;
 use crate::resampler_type::ResamplerType;
 
+mod eq;
 mod output;
 mod output_sample_rate;
 mod resampler_type;
@@ -151,6 +152,15 @@ fn main() {
                 ),
         )
         .arg(
+            Arg::new("eq-file")
+                .long("eq-file")
+                .value_name("PATH")
+                .value_parser(clap::value_parser!(PathBuf))
+                .help(
+                    "Parametric EQ preset (Equalizer APO / EasyEffects style: Preamp, Filter lines with PK/PEQ/LSC/HSC)",
+                ),
+        )
+        .arg(
             Arg::new("INPUT")
                 .help("The input file path, or - to use standard input")
                 .value_parser(clap::value_parser!(PathBuf))
@@ -264,6 +274,17 @@ fn run(args: &ArgMatches) -> Result<i32> {
                             .expect("output-sample-rate validated by clap possible_values")
                     });
 
+                let eq = if let Some(eq_path) = args.get_one::<PathBuf>("eq-file") {
+                    let text = fs::read_to_string(eq_path).map_err(Error::IoError)?;
+                    Some(
+                        eq::parse_parametric_eq(&text)
+                            .map_err(|_| Error::DecodeError("invalid parametric EQ file"))?,
+                    )
+                }
+                else {
+                    None
+                };
+
                 // Setup playback options.
                 let opts = PlayOptions {
                     decoder_opts: dec_opts.verify(args.is_present("verify")),
@@ -272,6 +293,7 @@ fn run(args: &ArgMatches) -> Result<i32> {
                     no_progress: args.is_present("no-progress"),
                     resampler_type,
                     output_sample_rate_hz,
+                    eq,
                 };
 
                 // Play it!
@@ -348,7 +370,7 @@ fn decode_only(mut reader: Box<dyn FormatReader>, opts: DecodeOptions) -> Result
 }
 
 /// Options for the play command.
-#[derive(Copy, Clone)]
+#[derive(Clone)]
 struct PlayOptions {
     decoder_opts: AudioDecoderOptions,
     track_num: Option<usize>,
@@ -357,10 +379,11 @@ struct PlayOptions {
     resampler_type: ResamplerType,
     /// Forced output stream rate (Hz); `None` uses previous default behavior per backend.
     output_sample_rate_hz: Option<u32>,
+    eq: Option<eq::EqConfig>,
 }
 
 /// Options for playing a single track.
-#[derive(Copy, Clone)]
+#[derive(Clone)]
 struct PlayTrackOptions {
     decoder_opts: AudioDecoderOptions,
     track_id: u32,
@@ -368,6 +391,7 @@ struct PlayTrackOptions {
     no_progress: bool,
     resampler_type: ResamplerType,
     output_sample_rate_hz: Option<u32>,
+    eq: Option<eq::EqConfig>,
 }
 
 fn play(mut reader: Box<dyn FormatReader>, opts: PlayOptions) -> Result<i32> {
@@ -423,15 +447,18 @@ fn play(mut reader: Box<dyn FormatReader>, opts: PlayOptions) -> Result<i32> {
         no_progress: opts.no_progress,
         resampler_type: opts.resampler_type,
         output_sample_rate_hz: opts.output_sample_rate_hz,
+        eq: opts.eq.clone(),
     };
 
     // The audio output device.
     let mut audio_output = None;
+    let mut eq_runtime: Option<eq::ParametricEqRuntime> = None;
 
     let result = loop {
-        match play_track(&mut reader, &mut audio_output, track_options) {
+        match play_track(&mut reader, &mut audio_output, &mut eq_runtime, track_options.clone()) {
             Err(Error::ResetRequired) => {
                 // Handle a demuxer reset.
+                eq_runtime = None;
                 track_options.track_id = match do_reset(&mut reader) {
                     Some(id) => id,
                     _ => return Ok(0),
@@ -453,6 +480,7 @@ fn play(mut reader: Box<dyn FormatReader>, opts: PlayOptions) -> Result<i32> {
 fn play_track(
     reader: &mut Box<dyn FormatReader>,
     audio_output: &mut Option<Box<dyn output::AudioOutput>>,
+    eq_runtime: &mut Option<eq::ParametricEqRuntime>,
     opts: PlayTrackOptions,
 ) -> Result<i32> {
     // Get the selected track using the track ID.
@@ -538,7 +566,16 @@ fn play_track(
                     }
 
                     if let Some(audio_output) = audio_output {
-                        audio_output.write(decoded).unwrap()
+                        if let Some(cfg) = &opts.eq {
+                            let rt = eq_runtime.get_or_insert_with(|| {
+                                eq::ParametricEqRuntime::new(cfg, decoded.spec())
+                            });
+                            let processed = rt.apply(decoded);
+                            audio_output.write(processed).unwrap();
+                        }
+                        else {
+                            audio_output.write(decoded).unwrap();
+                        }
                     }
                 }
             }
