@@ -34,7 +34,7 @@ libpulse-simple-binding = "2.5.0"
 coreaudio-rs = "0.14.0"
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
-cpal = "0.13.3"
+cpal = "0.17.3"
 rb = "0.3.2"
 rubato = "1.0.1"
 audioadapter-buffers = "2.0"

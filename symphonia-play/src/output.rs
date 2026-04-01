@@ -304,7 +304,7 @@ mod cpal {
     pub struct CpalAudioOutput;
 
     trait AudioOutputSample:
-        cpal::Sample + ConvertibleSample + IntoSample<f32> + std::marker::Send + 'static
+        cpal::SizedSample + ConvertibleSample + IntoSample<f32> + std::marker::Send + 'static
     {
     }
 
@@ -362,6 +362,10 @@ mod cpal {
                     output_sample_rate_hz,
                     &device,
                 ),
+                other => {
+                    error!("unsupported cpal sample format: {:?}", other);
+                    Err(AudioOutputError::OpenStreamError)
+                }
             }
         }
     }
@@ -391,7 +395,7 @@ mod cpal {
                 let rate = output_sample_rate_hz.unwrap_or(spec.rate());
                 cpal::StreamConfig {
                     channels: num_channels as cpal::ChannelCount,
-                    sample_rate: cpal::SampleRate(rate),
+                    sample_rate: rate,
                     buffer_size: cpal::BufferSize::Default,
                 }
             }
@@ -402,7 +406,7 @@ mod cpal {
                     .expect("Failed to get the default output config.")
                     .config();
                 if let Some(rate) = output_sample_rate_hz {
-                    cfg.sample_rate = cpal::SampleRate(rate);
+                    cfg.sample_rate = rate;
                 }
                 cfg
             };
@@ -434,7 +438,7 @@ mod cpal {
                     let mut matched = None;
                     for &sample_format in candidate_formats {
                         let desired = StreamFormat {
-                            sample_rate: config.sample_rate.0 as f64,
+                            sample_rate: config.sample_rate as f64,
                             sample_format,
                             flags: LinearPcmFlags::empty(),
                             channels: config.channels as u32,
@@ -449,36 +453,36 @@ mod cpal {
                         Some((mut asbd, matched_format)) => {
                             // find_matching_physical_format はレンジ内マッチの場合、
                             // 返される ASBD のサンプルレートが要求値と異なる可能性があるため上書き
-                            asbd.mSampleRate = config.sample_rate.0 as f64;
+                            asbd.mSampleRate = config.sample_rate as f64;
 
                             match set_device_physical_stream_format(device_id, asbd) {
                                 Ok(()) => {
                                     info!(
                                         "set macOS device physical format to {} Hz, {} bit ({:?})",
-                                        config.sample_rate.0, asbd.mBitsPerChannel, matched_format,
+                                        config.sample_rate, asbd.mBitsPerChannel, matched_format,
                                     );
                                 }
                                 Err(err) => {
                                     error!(
                                         "failed to set device physical format to {} Hz: {}",
-                                        config.sample_rate.0, err
+                                        config.sample_rate, err
                                     );
                                 }
                             }
                         }
                         None => {
-                            let target_rate = config.sample_rate.0 as f64;
+                            let target_rate = config.sample_rate as f64;
                             match set_device_sample_rate(device_id, target_rate) {
                                 Ok(()) => {
                                     info!(
                                         "set macOS device nominal sample rate to {} Hz (no physical format match; using nominal rates)",
-                                        config.sample_rate.0,
+                                        config.sample_rate,
                                     );
                                 }
                                 Err(err) => {
                                     error!(
                                         "failed to set device sample rate to {} Hz: {}",
-                                        config.sample_rate.0, err
+                                        config.sample_rate, err
                                     );
                                 }
                             }
@@ -491,7 +495,7 @@ mod cpal {
             }
 
             // Create a ring buffer with a capacity for up-to 200ms of audio.
-            let ring_len = ((200 * config.sample_rate.0 as usize) / 1000) * num_channels;
+            let ring_len = ((200 * config.sample_rate as usize) / 1000) * num_channels;
 
             let ring_buf = SpscRb::new(ring_len);
             let (ring_buf_producer, ring_buf_consumer) = (ring_buf.producer(), ring_buf.consumer());
@@ -504,9 +508,10 @@ mod cpal {
                     let written = ring_buf_consumer.read(data).unwrap_or(0);
 
                     // Mute any remaining samples.
-                    data[written..].iter_mut().for_each(|s| *s = T::MID);
+                    data[written..].iter_mut().for_each(|s| *s = T::EQUILIBRIUM);
                 },
                 move |err| error!("audio output error: {}", err),
+                None,
             );
 
             if let Err(err) = stream_result {
@@ -524,11 +529,11 @@ mod cpal {
                 return Err(AudioOutputError::PlayStreamError);
             }
 
-            let resampler = if spec.rate() != config.sample_rate.0 {
-                info!("resampling {} Hz to {} Hz", spec.rate(), config.sample_rate.0);
+            let resampler = if spec.rate() != config.sample_rate {
+                info!("resampling {} Hz to {} Hz", spec.rate(), config.sample_rate);
                 Some(Resampler::new(
                     spec,
-                    config.sample_rate.0,
+                    config.sample_rate,
                     duration.get() as usize,
                     resampler_type,
                 ))
@@ -538,7 +543,7 @@ mod cpal {
             };
 
             let device_info = OutputDeviceInfo {
-                sample_rate_hz: config.sample_rate.0,
+                sample_rate_hz: config.sample_rate,
                 bits_per_sample: (mem::size_of::<T>() * 8) as u32,
             };
 
