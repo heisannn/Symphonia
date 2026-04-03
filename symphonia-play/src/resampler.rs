@@ -7,7 +7,7 @@
 
 use std::marker::PhantomData;
 
-use audioadapter_buffers::direct::SequentialSliceOfVecs;
+use rubato::audioadapter_buffers::direct::SequentialSliceOfVecs;
 use rubato::{
     Async, Fft, FixedAsync, FixedSync, PolynomialDegree, Resampler as RubatoResampler,
     SincInterpolationParameters, SincInterpolationType, WindowFunction,
